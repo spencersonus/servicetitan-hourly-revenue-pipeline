@@ -1,73 +1,127 @@
-def write_invoices(
-    self,
-    df: pd.DataFrame,
-    dedupe_key: str = "invoice_id",
-    updated_col: str = "updated_at",
-) -> GoogleSheetsWriteResult:
+from __future__ import annotations
 
-    incoming = int(df.shape[0])
+from dataclasses import dataclass
+import os
+import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
-    sh = self._client.open_by_key(self.sheet_id)
 
-    try:
-        worksheet = sh.worksheet(self.sheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = sh.add_worksheet(
-            title=self.sheet_name,
-            rows=1,
-            cols=len(df.columns),
+@dataclass
+class GoogleSheetsWriteResult:
+    rows_incoming: int
+    rows_written: int
+    sheet_id: str
+    sheet_name: str
+
+
+class GoogleSheetsWriter:
+    """
+    Writes invoice rows to a Google Sheet.
+
+    - Appends new rows
+    - Deduplicates by invoice_id (keeps latest updated_at)
+    - Rewrites entire worksheet
+    - Sanitizes NaN / inf values
+    - Converts everything safely to strings before upload
+    """
+
+    def __init__(self, sheet_id: str, sheet_name: str = "invoices") -> None:
+        self.sheet_id = sheet_id
+        self.sheet_name = sheet_name
+        self._client = self._authorize()
+
+    def _authorize(self) -> gspread.Client:
+        client_email = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL")
+        private_key = os.environ.get("GOOGLE_PRIVATE_KEY")
+
+        if not client_email:
+            raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL")
+
+        if not private_key:
+            raise RuntimeError("Missing GOOGLE_PRIVATE_KEY")
+
+        credentials_dict = {
+            "type": "service_account",
+            "client_email": client_email.strip(),
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+        creds = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=scopes,
         )
-        worksheet.append_row(list(df.columns))
 
-    existing_data = worksheet.get_all_values()
+        return gspread.authorize(creds)
 
-    if existing_data:
-        header = existing_data[0]
-        existing_rows = existing_data[1:]
-        existing_df = pd.DataFrame(existing_rows, columns=header)
-    else:
-        existing_df = pd.DataFrame(columns=df.columns)
+    def write_invoices(self, df: pd.DataFrame) -> GoogleSheetsWriteResult:
 
-    combined = pd.concat([existing_df, df], ignore_index=True, sort=False)
+        incoming = int(df.shape[0])
 
-    # Deduplicate
-    if dedupe_key in combined.columns and updated_col in combined.columns:
-        combined[updated_col] = pd.to_datetime(
-            combined[updated_col],
-            errors="coerce",
+        sh = self._client.open_by_key(self.sheet_id)
+
+        try:
+            worksheet = sh.worksheet(self.sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sh.add_worksheet(
+                title=self.sheet_name,
+                rows=1,
+                cols=len(df.columns),
+            )
+            worksheet.append_row(list(df.columns))
+
+        existing_data = worksheet.get_all_values()
+
+        if existing_data:
+            header = existing_data[0]
+            existing_rows = existing_data[1:]
+            existing_df = pd.DataFrame(existing_rows, columns=header)
+        else:
+            existing_df = pd.DataFrame(columns=df.columns)
+
+        combined = pd.concat([existing_df, df], ignore_index=True, sort=False)
+
+        # Deduplicate by invoice_id
+        if "invoice_id" in combined.columns and "updated_at" in combined.columns:
+            combined["updated_at"] = pd.to_datetime(
+                combined["updated_at"],
+                errors="coerce",
+            )
+            combined.sort_values(
+                by=["invoice_id", "updated_at"],
+                ascending=[True, False],
+                inplace=True,
+            )
+            combined = combined.drop_duplicates(
+                subset=["invoice_id"],
+                keep="first",
+            )
+
+        # Remove NaN / Infinity
+        combined = combined.replace([float("inf"), float("-inf")], None)
+        combined = combined.where(pd.notnull(combined), None)
+
+        # Convert everything safely to string
+        safe_values = [combined.columns.tolist()]
+
+        for row in combined.itertuples(index=False):
+            safe_row = []
+            for value in row:
+                if value is None:
+                    safe_row.append("")
+                else:
+                    safe_row.append(str(value))
+            safe_values.append(safe_row)
+
+        worksheet.clear()
+        worksheet.update(safe_values)
+
+        return GoogleSheetsWriteResult(
+            rows_incoming=incoming,
+            rows_written=int(len(combined)),
+            sheet_id=self.sheet_id,
+            sheet_name=self.sheet_name,
         )
-        combined.sort_values(
-            by=[dedupe_key, updated_col],
-            ascending=[True, False],
-            inplace=True,
-        )
-        combined = combined.drop_duplicates(
-            subset=[dedupe_key],
-            keep="first",
-        )
-
-    # 🔥 HARD SANITIZE EVERYTHING
-    combined = combined.replace([float("inf"), float("-inf")], None)
-    combined = combined.where(pd.notnull(combined), None)
-
-    # Convert entire dataframe to pure Python strings safely
-    safe_values = [combined.columns.tolist()]
-
-    for row in combined.itertuples(index=False):
-        safe_row = []
-        for value in row:
-            if value is None:
-                safe_row.append("")
-            else:
-                safe_row.append(str(value))
-        safe_values.append(safe_row)
-
-    worksheet.clear()
-    worksheet.update(safe_values)
-
-    return GoogleSheetsWriteResult(
-        rows_incoming=incoming,
-        rows_written=int(len(combined)),
-        sheet_id=self.sheet_id,
-        sheet_name=self.sheet_name,
-    )
