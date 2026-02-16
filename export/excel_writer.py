@@ -1,70 +1,134 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
+import os
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 @dataclass
-class ExcelWriteResult:
+class GoogleSheetsWriteResult:
     rows_incoming: int
     rows_written: int
-    file_path: str
+    sheet_id: str
+    sheet_name: str
 
 
-class ExcelWriter:
+class GoogleSheetsWriter:
     """
-    Writes a single flat Excel file with one sheet: 'invoices'.
+    Writes invoice rows to a Google Sheet.
 
-    - File: invoices.xlsx (path provided by Settings)
-    - Sheet name: invoices
-    - Columns:
-        invoice_id, invoice_date, business_unit, job_type, total_amount, updated_at
-
-    If file exists:
-      - Load existing sheet
-      - Append new rows
-      - Deduplicate by invoice_id
-      - Keep the most recent updated_at
-      - Rewrite entire sheet
-
-    If file does not exist:
-      - Create file
-      - Write sheet
-
-    No formatting. No multiple sheets.
+    - Appends new rows
+    - Deduplicates by invoice_id (keeps latest updated_at)
+    - Rewrites entire worksheet
+    - Sanitizes NaN / inf values
+    - Converts everything safely to strings before upload
     """
 
-    def __init__(self, output_path: str, sheet_name: str = "invoices") -> None:
-        self._output_path = output_path
-        self._sheet_name = sheet_name
+    def __init__(self, sheet_id: str, sheet_name: str = "invoices") -> None:
+        self.sheet_id = sheet_id
+        self.sheet_name = sheet_name
+        self._client = self._authorize()
 
-    def write_invoices(self, df: pd.DataFrame) -> ExcelWriteResult:
-        output_file = Path(self._output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+    def _authorize(self) -> gspread.Client:
+        client_email = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL")
+        private_key = os.environ.get("GOOGLE_PRIVATE_KEY")
+
+        if not client_email:
+            raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL")
+
+        if not private_key:
+            raise RuntimeError("Missing GOOGLE_PRIVATE_KEY")
+
+        credentials_dict = {
+            "type": "service_account",
+            "client_email": client_email.strip(),
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+        creds = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=scopes,
+        )
+
+        return gspread.authorize(creds)
+
+    def write_invoices(
+        self,
+        df: pd.DataFrame,
+        dedupe_key: str = "invoice_id",
+        updated_col: str = "updated_at",
+    ) -> GoogleSheetsWriteResult:
 
         incoming = int(df.shape[0])
 
-        if output_file.exists():
-            existing = pd.read_excel(output_file, sheet_name=self._sheet_name, engine="openpyxl")
-            combined = pd.concat([existing, df], ignore_index=True)
+        sh = self._client.open_by_key(self.sheet_id)
+
+        try:
+            worksheet = sh.worksheet(self.sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sh.add_worksheet(
+                title=self.sheet_name,
+                rows=1,
+                cols=len(df.columns),
+            )
+            worksheet.append_row(list(df.columns))
+
+        existing_data = worksheet.get_all_values()
+
+        if existing_data:
+            header = existing_data[0]
+            existing_rows = existing_data[1:]
+            existing_df = pd.DataFrame(existing_rows, columns=header)
         else:
-            combined = df.copy()
+            existing_df = pd.DataFrame(columns=df.columns)
 
-        # Deduplicate by invoice_id keeping most recent updated_at
-        if not combined.empty:
-            # ensure strings for sorting; ISO timestamps sort lexicographically correctly
-            combined["updated_at"] = combined["updated_at"].astype("string")
-            combined.sort_values(by=["invoice_id", "updated_at"], ascending=[True, False], inplace=True)
-            combined = combined.drop_duplicates(subset=["invoice_id"], keep="first")
+        combined = pd.concat([existing_df, df], ignore_index=True, sort=False)
 
-            # Keep column order
-            combined = combined[
-                ["invoice_id", "invoice_date", "business_unit", "job_type", "total_amount", "updated_at"]
-            ]
+        # Deduplicate logic
+        if dedupe_key in combined.columns and updated_col in combined.columns:
+            combined[updated_col] = pd.to_datetime(
+                combined[updated_col],
+                errors="coerce",
+            )
+            combined.sort_values(
+                by=[dedupe_key, updated_col],
+                ascending=[True, False],
+                inplace=True,
+            )
+            combined = combined.drop_duplicates(
+                subset=[dedupe_key],
+                keep="first",
+            )
 
-        with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-            combined.to_excel(writer, index=False, sheet_name=self._sheet_name)
+        # 🔥 Critical: sanitize float / NaN values
+        combined = combined.replace([float("inf"), float("-inf")], None)
+        combined = combined.where(pd.notnull(combined), None)
 
-        return ExcelWriteResult(rows_incoming=incoming, rows_written=int(combined.shape[0]), file_path=str(output_file))
+        # Convert everything safely to string values
+        combined = combined.astype(object)
+
+        safe_values = [combined.columns.tolist()]
+
+        for _, row in combined.iterrows():
+            safe_row = []
+            for value in row:
+                if value is None:
+                    safe_row.append("")
+                else:
+                    safe_row.append(str(value))
+            safe_values.append(safe_row)
+
+        worksheet.clear()
+        worksheet.update(safe_values)
+
+        return GoogleSheetsWriteResult(
+            rows_incoming=incoming,
+            rows_written=int(len(combined)),
+            sheet_id=self.sheet_id,
+            sheet_name=self.sheet_name,
+        )
