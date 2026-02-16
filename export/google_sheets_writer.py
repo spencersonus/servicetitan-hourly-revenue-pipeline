@@ -22,7 +22,7 @@ class GoogleSheetsWriter:
     - Appends new rows
     - Deduplicates by invoice_id (keeps latest updated_at)
     - Rewrites entire worksheet
-    - Uses service account credentials from environment variables
+    - Sanitizes NaN / inf values
     """
 
     def __init__(self, sheet_id: str, sheet_name: str = "invoices") -> None:
@@ -40,8 +40,6 @@ class GoogleSheetsWriter:
         if not private_key:
             raise RuntimeError("Missing GOOGLE_PRIVATE_KEY")
 
-        # IMPORTANT: do NOT modify formatting
-        # We now expect the private key to be stored as a normal multiline value
         credentials_dict = {
             "type": "service_account",
             "client_email": client_email.strip(),
@@ -79,11 +77,11 @@ class GoogleSheetsWriter:
             )
             worksheet.append_row(list(df.columns))
 
-        data = worksheet.get_all_values()
+        existing_data = worksheet.get_all_values()
 
-        if data:
-            header = data[0]
-            existing_rows = data[1:]
+        if existing_data:
+            header = existing_data[0]
+            existing_rows = existing_data[1:]
             existing_df = pd.DataFrame(existing_rows, columns=header)
         else:
             existing_df = pd.DataFrame(columns=df.columns)
@@ -105,12 +103,17 @@ class GoogleSheetsWriter:
                 keep="first",
             )
 
-        combined_values = [
+        # 🔥 CRITICAL FIX: Remove NaN / inf before JSON encoding
+        combined = combined.replace([float("inf"), float("-inf")], None)
+        combined = combined.where(pd.notnull(combined), None)
+
+        # Convert everything to string safely
+        safe_values = [
             combined.columns.tolist()
         ] + combined.astype(str).values.tolist()
 
         worksheet.clear()
-        worksheet.update(combined_values)
+        worksheet.update(safe_values)
 
         return GoogleSheetsWriteResult(
             rows_incoming=incoming,
