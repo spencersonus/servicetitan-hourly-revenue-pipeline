@@ -4,20 +4,20 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 
 from dotenv import load_dotenv
 
 from config.settings import Settings
-from export.excel_writer import ExcelWriter
 from services.api_client import ApiClient
 from services.auth import OAuthClientCredentialsProvider
 from services.revenue_service import RevenueService
 from transform.revenue_transformer import RevenueTransformer
+from export.google_sheets_writer import GoogleSheetsWriter
 
 
 def setup_logging(log_path: str) -> logging.Logger:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-
     logger = logging.getLogger("servicetitan-invoices")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -39,14 +39,13 @@ def setup_logging(log_path: str) -> logging.Logger:
     logger.addHandler(ch)
     logger.addHandler(fh)
 
-    # Ensure UTC timestamps in logs
+    # Ensure UTC timestamps
     logging.Formatter.converter = time.gmtime  # type: ignore[attr-defined]
 
     return logger
 
 
 def main() -> None:
-    # Load .env locally (GitHub Actions provides env vars via Secrets; dotenv is harmless there)
     load_dotenv()
 
     settings = Settings.from_env()
@@ -77,32 +76,33 @@ def main() -> None:
         page_size=settings.page_size,
     )
 
-    last_sync_utc = revenue_service.read_last_sync_utc()
-    logger.info("state | last_sync_utc=%s", last_sync_utc)
-
-    logger.info("token | retrieving access token")
+    # Retrieve token
+    logger.info("token retrieval | fetching access token")
     _ = token_provider.get_token()
-    logger.info("token | ok")
+    logger.info("token retrieval | success")
 
-    logger.info("fetch | pulling invoices updated since last sync")
+    # Fetch invoices updated since last sync
+    logger.info("fetch | retrieving updated invoices")
     invoices = revenue_service.fetch_updated_invoices()
-    logger.info("fetch | records_fetched=%d", len(invoices))
+    logger.info("fetch | records fetched=%d", len(invoices))
 
     transformer = RevenueTransformer()
     df = transformer.transform(invoices)
-    logger.info("transform | rows=%d", int(df.shape[0]))
+    logger.info("transform | records transformed=%d", int(df.shape[0]))
 
-    writer = ExcelWriter(settings.output_path, sheet_name="invoices")
+    # Write to Google Sheets
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        raise RuntimeError("GOOGLE_SHEET_ID environment variable is required")
+    writer = GoogleSheetsWriter(sheet_id=sheet_id)
     result = writer.write_invoices(df)
-
     logger.info(
-        "export | incoming_rows=%d total_rows_after_write=%d file=%s",
+        "export | incoming_rows=%d written_rows=%d",
         result.rows_incoming,
         result.rows_written,
-        result.file_path,
     )
 
-    # Update sync_state.json ONLY after successful write
+    # Update sync state
     revenue_service.update_sync_state_to_now()
     logger.info("state | sync_state updated")
 
