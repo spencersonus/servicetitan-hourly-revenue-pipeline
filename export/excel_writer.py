@@ -16,15 +16,6 @@ class GoogleSheetsWriteResult:
 
 
 class GoogleSheetsWriter:
-    """
-    Writes invoice rows to a Google Sheet.
-
-    - Appends new rows
-    - Deduplicates by invoice_id (keeps latest updated_at)
-    - Rewrites entire worksheet
-    - Sanitizes NaN / inf values
-    - Converts everything safely to strings before upload
-    """
 
     def __init__(self, sheet_id: str, sheet_name: str = "invoices") -> None:
         self.sheet_id = sheet_id
@@ -57,12 +48,7 @@ class GoogleSheetsWriter:
 
         return gspread.authorize(creds)
 
-    def write_invoices(
-        self,
-        df: pd.DataFrame,
-        dedupe_key: str = "invoice_id",
-        updated_col: str = "updated_at",
-    ) -> GoogleSheetsWriteResult:
+    def write_invoices(self, df: pd.DataFrame) -> GoogleSheetsWriteResult:
 
         incoming = int(df.shape[0])
 
@@ -89,32 +75,27 @@ class GoogleSheetsWriter:
 
         combined = pd.concat([existing_df, df], ignore_index=True, sort=False)
 
-        # Deduplicate logic
-        if dedupe_key in combined.columns and updated_col in combined.columns:
-            combined[updated_col] = pd.to_datetime(
-                combined[updated_col],
+        if "invoice_id" in combined.columns and "updated_at" in combined.columns:
+            combined["updated_at"] = pd.to_datetime(
+                combined["updated_at"],
                 errors="coerce",
             )
             combined.sort_values(
-                by=[dedupe_key, updated_col],
+                by=["invoice_id", "updated_at"],
                 ascending=[True, False],
                 inplace=True,
             )
             combined = combined.drop_duplicates(
-                subset=[dedupe_key],
+                subset=["invoice_id"],
                 keep="first",
             )
 
-        # 🔥 Critical: sanitize float / NaN values
         combined = combined.replace([float("inf"), float("-inf")], None)
         combined = combined.where(pd.notnull(combined), None)
 
-        # Convert everything safely to string values
-        combined = combined.astype(object)
-
         safe_values = [combined.columns.tolist()]
 
-        for _, row in combined.iterrows():
+        for row in combined.itertuples(index=False):
             safe_row = []
             for value in row:
                 if value is None:
