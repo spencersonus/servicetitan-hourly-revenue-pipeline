@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import logging
 import time
 from datetime import datetime, timezone
@@ -13,7 +12,7 @@ from services.api_client import ApiClient
 from services.auth import OAuthClientCredentialsProvider
 from services.revenue_service import RevenueService
 from transform.revenue_transformer import RevenueTransformer
-from export.google_sheets_writer import GoogleSheetsWriter
+from export.databox_writer import DataboxWriter
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -41,16 +40,13 @@ def setup_logging(log_path: str) -> logging.Logger:
 
     # Ensure UTC timestamps
     logging.Formatter.converter = time.gmtime  # type: ignore[attr-defined]
-
     return logger
 
 
 def main() -> None:
     load_dotenv()
-
     settings = Settings.from_env()
     logger = setup_logging(settings.log_path)
-
     start = time.time()
     run_started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     logger.info("start | run_started=%s", run_started)
@@ -90,11 +86,15 @@ def main() -> None:
     df = transformer.transform(invoices)
     logger.info("transform | records transformed=%d", int(df.shape[0]))
 
-    # Write to Google Sheets
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID environment variable is required")
-    writer = GoogleSheetsWriter(sheet_id=sheet_id)
+    # Write to Databox
+    databox_token = os.environ.get("DATABOX_PUSH_TOKEN")
+    dataset_id = os.environ.get("DATABOX_DATASET_ID")
+    if not databox_token:
+        raise RuntimeError("DATABOX_PUSH_TOKEN environment variable is required")
+    if not dataset_id:
+        raise RuntimeError("DATABOX_DATASET_ID environment variable is required")
+
+    writer = DataboxWriter(api_key=databox_token, dataset_id=dataset_id)
     result = writer.write_invoices(df)
     logger.info(
         "export | incoming_rows=%d written_rows=%d",
