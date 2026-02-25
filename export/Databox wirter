@@ -1,0 +1,94 @@
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
+import requests
+
+logger = logging.getLogger("servicetitan-invoices")
+
+# Databox API v1 ingests row-level records into datasets.
+# Endpoint: POST /v1/datasets/{datasetId}/data
+# Docs: https://help.databox.com/send-data-to-databox-via-api
+
+DATABOX_API_BASE = "https://api.databox.com"
+BATCH_SIZE = 100  # Max records per API call to stay safe on payload size
+
+
+@dataclass
+class WriteResult:
+    rows_incoming: int
+    rows_written: int
+
+
+class DataboxWriter:
+    """Pushes invoice DataFrame rows to a Databox dataset via API v1."""
+
+    def __init__(self, api_key: str, dataset_id: str) -> None:
+        self.api_key = api_key
+        self.dataset_id = dataset_id
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+        })
+
+    def _push_batch(self, records: list[dict[str, Any]]) -> dict:
+        """Push a batch of records to the Databox dataset."""
+        url = f"{DATABOX_API_BASE}/v1/datasets/{self.dataset_id}/data"
+        payload = {"records": records}
+
+        response = self.session.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def write_invoices(self, df: pd.DataFrame) -> WriteResult:
+        """
+        Write invoice rows to Databox.
+
+        Expects a DataFrame with columns:
+            invoice_id, invoice_date, business_unit, job_type, total_amount, updated_at
+        """
+        rows_incoming = len(df)
+        if rows_incoming == 0:
+            logger.info("databox | no rows to push")
+            return WriteResult(rows_incoming=0, rows_written=0)
+
+        # Convert DataFrame to list of record dicts matching your sheet columns
+        records = []
+        for _, row in df.iterrows():
+            record = {
+                "invoice_id": str(row.get("invoice_id", "")),
+                "invoice_date": str(row.get("invoice_date", "")),
+                "business_unit": str(row.get("business_unit", "")),
+                "job_type": str(row.get("job_type", "")),
+                "total_amount": float(row.get("total_amount", 0)),
+                "updated_at": str(row.get("updated_at", "")),
+            }
+            records.append(record)
+
+        # Push in batches
+        rows_written = 0
+        for i in range(0, len(records), BATCH_SIZE):
+            batch = records[i : i + BATCH_SIZE]
+            try:
+                result = self._push_batch(batch)
+                ingestion_id = result.get("ingestionId", "unknown")
+                logger.info(
+                    "databox | batch pushed rows=%d ingestion_id=%s",
+                    len(batch),
+                    ingestion_id,
+                )
+                rows_written += len(batch)
+            except requests.exceptions.HTTPError as e:
+                logger.error(
+                    "databox | batch failed at offset=%d error=%s response=%s",
+                    i,
+                    str(e),
+                    e.response.text if e.response else "no response",
+                )
+                raise
+
+        logger.info("databox | total pushed rows=%d", rows_written)
+        return WriteResult(rows_incoming=rows_incoming, rows_written=rows_written)
