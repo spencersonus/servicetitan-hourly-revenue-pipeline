@@ -2,8 +2,8 @@ name: ServiceTitan Hourly Sync
 
 on:
   schedule:
-    - cron: "0 * * * *"   # runs every hour
-  workflow_dispatch:       # allows manual run
+    - cron: "0 * * * *"  # runs every hour
+  workflow_dispatch:      # allows manual run
 
 jobs:
   sync:
@@ -31,8 +31,6 @@ jobs:
           APP_KEY: ${{ secrets.APP_KEY }}
           BASE_URL: ${{ secrets.BASE_URL }}
 
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
+          DATABOX_PUSH_TOKEN: ${{ secrets.DATABOX_PUSH_TOKEN }}
 
         run: python main.py
